@@ -5,25 +5,23 @@ import kotlin.reflect.KClass
 fun main() {
     val spots = listOf(
         ParkingSpot.Compact("C1"),
-        ParkingSpot.Compact("C2"),
         ParkingSpot.Regular("R1"),
-        ParkingSpot.Regular("R2"),
         ParkingSpot.Large("L1")
     )
 
     val coordinator = ParkingCoordinatorImpl(spots)
-    val system = ParkingSystem(coordinator)
+    val feeCalculator = ParkingFeeCalculator()
+    val sessionManager = ParkingSessionManagerImpl(feeCalculator)
+    val system = ParkingSystem(coordinator, sessionManager)
 
-    val motorcycle = Vehicle.Motorcycle("M1")
     val car = Vehicle.Car("CAR1")
-    val truck = Vehicle.Truck("T1")
+    val truck = Vehicle.Truck("TRUCK1")
 
-    val motoSpot = system.park(motorcycle)  // parks in C1 (first compatible)
-    val carSpot = system.park(car)          // parks in R1 (can't use compact)
-    system.park(truck)                      // parks in L1 (large only)
+    system.park(car)    // parks at R1
+    system.park(truck)  // parks at L1
 
-    motoSpot?.let { system.leave(it) }      // C1 is free again
-    system.park(car)                        // now parks in R2
+    system.checkOut(car)   // fee based on duration at Regular rate
+    system.checkOut(truck) // fee based on duration at Large rate
 }
 
 
@@ -32,6 +30,14 @@ sealed class ParkingSpot(val id: String) {
     class Regular(id: String) : ParkingSpot(id)
     class Large(id: String) : ParkingSpot(id)
 }
+
+data class ParkingSession(
+    val vehicle: Vehicle,
+    val spot: ParkingSpot,
+    val entryTime: Long,
+    val exitTime: Long? = null,  // null until session ends
+    val fee: Int? = null
+)
 
 sealed class Vehicle(val id: String) {
     abstract val compatibleSpots: List<KClass<out ParkingSpot>>
@@ -56,10 +62,56 @@ sealed class Vehicle(val id: String) {
     }
 }
 
+interface FeeCalculator {
+    fun calculate(spot: ParkingSpot, durationMinutes: Long): Int
+}
+
+interface ParkingSessionManager {
+    fun startSession(vehicle: Vehicle, parkingSpot: ParkingSpot)
+    fun endSession(vehicle: Vehicle): ParkingSession
+    fun getSession(vehicle: Vehicle): ParkingSession
+}
+
 interface ParkingCoordinator {
     fun park(vehicle: Vehicle): ParkingSpot?
     fun leave(spot: ParkingSpot)
     fun getAvailableSpots(vehicle: Vehicle): List<ParkingSpot>
+}
+
+class ParkingFeeCalculator : FeeCalculator {
+    override fun calculate(spot: ParkingSpot, durationMinutes: Long): Int {
+        val hours = maxOf(1, (durationMinutes / 60).toInt()) // minimum 1 hour charge
+        return when (spot) {
+            is ParkingSpot.Compact -> 10 * hours
+            is ParkingSpot.Regular -> 20 * hours
+            is ParkingSpot.Large -> 30 * hours
+        }
+    }
+}
+
+class ParkingSessionManagerImpl(
+    private val feeCalculator: FeeCalculator
+) : ParkingSessionManager {
+    private val sessions = mutableMapOf<String, ParkingSession>() // vehicleId -> session
+
+    override fun startSession(vehicle: Vehicle, spot: ParkingSpot) {
+        val session = ParkingSession(vehicle, spot, System.currentTimeMillis())
+        sessions[vehicle.id] = session
+    }
+
+    override fun endSession(vehicle: Vehicle): ParkingSession {
+        val session = sessions[vehicle.id]
+            ?: throw IllegalStateException("No session for ${vehicle::class.simpleName} ${vehicle.id}")
+        val durationMinutes = (System.currentTimeMillis() - session.entryTime) / 60_000
+        val fee = feeCalculator.calculate(session.spot, durationMinutes)
+        sessions.remove(vehicle.id)
+        return session.copy(exitTime = System.currentTimeMillis(), fee = fee)
+    }
+
+    override fun getSession(vehicle: Vehicle): ParkingSession {
+        return sessions[vehicle.id]
+            ?: throw IllegalStateException("No session for ${vehicle::class.simpleName} ${vehicle.id}")
+    }
 }
 
 class ParkingCoordinatorImpl(
@@ -93,15 +145,29 @@ class ParkingCoordinatorImpl(
     }
 }
 
-class ParkingSystem(private val coordinator: ParkingCoordinator) {
-
+class ParkingSystem(
+    private val coordinator: ParkingCoordinator,
+    private val sessionManager: ParkingSessionManager? = null // optional - OCP!
+) {
     fun park(vehicle: Vehicle): ParkingSpot? {
-        val spot = coordinator.park(vehicle)
-        if (spot == null) println("No available spot for ${vehicle::class.simpleName} ${vehicle.id}")
+        val spot = coordinator.park(vehicle) ?: return null
+        sessionManager?.startSession(vehicle, spot)
         return spot
     }
 
-    fun leave(spot: ParkingSpot) = coordinator.leave(spot)
+    fun checkOut(vehicle: Vehicle): ParkingSession {
+        val session = sessionManager?.endSession(vehicle)
+            ?: throw IllegalStateException("No session manager configured")
+        coordinator.leave(session.spot)
+        println(
+            "${vehicle.id} checked out. Fee: ${session.fee} cents. Duration: ${
+                (session.exitTime!! - session.entryTime) / 60_000
+            } minutes"
+        )
+        return session
+    }
+
+    fun leave(spot: ParkingSpot) = coordinator.leave(spot) // still works without fees!
 
     fun getAvailableSpots(vehicle: Vehicle) = coordinator.getAvailableSpots(vehicle)
 }
