@@ -1,24 +1,78 @@
 fun main() {
     val inventory = LibraryInventory()
     val borrowManager = LibraryBorrowManager(borrowLimit = 3, inventory = inventory)
-    val library = Library(inventory, borrowManager)
+    val reservationManager = ReservationManagerImpl()
+    val notifier = ConsoleReservationNotifier()
+    val library = Library(inventory, borrowManager, reservationManager, notifier)
 
-    val book1 = Book("B1", "Clean Code", "Robert Martin")
-    val book2 = Book("B2", "Kotlin in Action", "Isakova")
-    val member = Member("M1", "Alice")
+    val book = Book("B1", "Clean Code", "Robert Martin")
+    val alice = Member("M1", "Alice")
+    val bob = Member("M2", "Bob")
+    val charlie = Member("M3", "Charlie")
 
-    library.addBook(book1)
-    library.addBook(book2)
+    library.addBook(book) // 1 copy
 
-    library.borrowBook(member, "B1")
-    library.borrowBook(member, "B2")
+    library.borrowBook(alice, "B1")   // Alice borrows it
+    library.reserve(bob, "B1")        // Bob joins waitlist (position 1)
+    library.reserve(charlie, "B1")    // Charlie joins waitlist (position 2)
 
-    println(library.getBorrowedBooks(member).map { it.name })
-    // [Clean Code, Kotlin in Action]
+    library.returnBook(alice, "B1")
+    // Bob gets auto-assigned + notified
+    // Charlie remains on waitlist
 
-    library.returnBook(member, "B1")
-    println(library.getAvailableBooks().map { it.name })
-    // [Clean Code]
+    library.returnBook(bob, "B1")
+    // Charlie gets auto-assigned + notified
+}
+
+data class Reservation(
+    val member: Member,
+    val book: Book,
+    val reservedAt: Long = System.currentTimeMillis()
+)
+
+interface ReservationManager {
+    fun reserve(member: Member, book: Book)
+    fun cancel(member: Member, book: Book)
+    fun getNextReservation(bookId: String): Reservation?
+    fun hasReservation(bookId: String): Boolean
+}
+
+interface ReservationNotifier {
+    fun notify(member: Member, book: Book)
+}
+
+class ConsoleReservationNotifier : ReservationNotifier {
+    override fun notify(member: Member, book: Book) {
+        println("📚 Hey ${member.name}! '${book.name}' is now available for you.")
+    }
+}
+
+class ReservationManagerImpl(
+) : ReservationManager {
+    // bookId -> queue of reservations
+    private val reservations = mutableMapOf<String, ArrayDeque<Reservation>>()
+
+    override fun reserve(member: Member, book: Book) {
+        val queue = reservations.getOrPut(book.id) { ArrayDeque() }
+        if (queue.any { it.member == member })
+            throw IllegalStateException("${member.name} already reserved '${book.name}'")
+        queue.addLast(Reservation(member, book))
+        println("${member.name} added to waitlist for '${book.name}' (position ${queue.size})")
+    }
+
+    override fun cancel(member: Member, book: Book) {
+        reservations[book.id]?.removeIf { it.member == member }
+            ?: throw IllegalStateException("No reservations found for '${book.name}'")
+        println("${member.name}'s reservation for '${book.name}' cancelled")
+    }
+
+    override fun getNextReservation(bookId: String): Reservation? {
+        return reservations[bookId]?.firstOrNull()
+    }
+
+    override fun hasReservation(bookId: String): Boolean {
+        return reservations[bookId]?.isNotEmpty() ?: false
+    }
 }
 
 data class Book(
@@ -107,7 +161,9 @@ class LibraryBorrowManager(
 
 class Library(
     private val inventory: InventoryManager,
-    private val borrowManager: BorrowManager
+    private val borrowManager: BorrowManager,
+    private val reservationManager: ReservationManager? = null,
+    private val notifier: ReservationNotifier? = null
 ) {
     fun addBook(book: Book) = inventory.addBook(book)
 
@@ -125,9 +181,36 @@ class Library(
             ?: throw IllegalArgumentException("Book $bookId not found")
         borrowManager.returnBook(member, book)
         println("${member.name} returned '${book.name}'")
+
+        // check if anyone is waiting
+        if (reservationManager?.hasReservation(bookId) == true) {
+            val reservation = reservationManager.getNextReservation(bookId)
+            if (reservation != null) {
+                borrowManager.borrowBook(reservation.member, book)
+                reservationManager.cancel(reservation.member, book)
+                notifier?.notify(reservation.member, book)
+                println("'${book.name}' auto-assigned to ${reservation.member.name}")
+            }
+        }
     }
 
     fun getBorrowedBooks(member: Member): List<Book> {
         return borrowManager.getBorrowedBooks(member)
+    }
+
+    fun reserve(member: Member, bookId: String) {
+        val book = inventory.getBook(bookId)
+            ?: throw IllegalArgumentException("Book $bookId not found")
+        if (inventory.quantity(bookId) > 0)
+            throw IllegalArgumentException("'${book.name}' is available — just borrow it!")
+        reservationManager?.reserve(member, book)
+            ?: throw IllegalStateException("Reservation system not configured")
+    }
+
+    fun cancelReservation(member: Member, bookId: String) {
+        val book = inventory.getBook(bookId)
+            ?: throw IllegalArgumentException("Book $bookId not found")
+        reservationManager?.cancel(member, book)
+            ?: throw IllegalStateException("Reservation system not configured")
     }
 }
